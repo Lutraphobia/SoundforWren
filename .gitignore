@@ -1,0 +1,54 @@
+# Audio: never commit copyrighted material
+*.mp3
+*.flac
+*.wav
+*.aac
+*.ogg
+*.m4a
+*.opus
+*.wma
+
+# Run outputs (regenerable, often derived from copyrighted audio)
+output/
+output_*/
+_run_*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+SoundforAI/
+Include/
+Lib/
+Scripts/
+share/
+pyvenv.cfg
+
+# Companion memory (local-only state)
+companion_memory.json
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# MCP local config (do not commit credentials or paths)
+.claude/
+
+# OS
+desktop.ini

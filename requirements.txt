@@ -1,0 +1,8 @@
+librosa==0.11.0
+matplotlib==3.10.9
+numpy==2.2.6
+scipy==1.15.3
+soundfile==0.13.1
+yt-dlp==2026.3.17
+numba==0.65.1
+mcp
