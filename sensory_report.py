@@ -35,6 +35,17 @@ import warnings
 import colorsys
 warnings.filterwarnings('ignore')
 
+# ─── LYRICS CONFIG (mutated by main() from CLI flags) ────────────────────────
+_LYRICS_ENABLED = True
+_LYRICS_MODEL   = 'large-v3'
+
+# ─── LISTEN-CAPTURE CONFIG (mutated by main() from CLI flags) ────────────────
+_LISTEN_SOURCE        = None
+_LISTEN_WHY           = None
+_LISTEN_VOCAL_MODE    = None
+_LISTEN_PRIMARY_LAYER = None
+_LISTEN_TAGS          = None
+
 # Force UTF-8 stdout on Windows so unicode arrows / box chars print cleanly.
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -50,6 +61,19 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
+
+# Optional v2 motion lenses (harmonic_motion + timbral_motion).
+# Loaded lazily so sensory_report.py still imports cleanly if these
+# sibling modules are missing (e.g. partial install). When present,
+# extract_features() emits an additional 'motion' dict.
+try:
+    import harmonic_motion as _hm
+except ImportError:
+    _hm = None
+try:
+    import timbral_motion as _tm
+except ImportError:
+    _tm = None
 
 # ─── COLORS ───────────────────────────────────────────────────────────────────
 DARK_BG  = '#07070c'
@@ -82,6 +106,62 @@ def load_audio(path, sr=22050):
     return y, sr
 
 
+def _av_decode_stereo(path: str, target_sr: int = 22050):
+    """Decode any ffmpeg-supported format (WMA, M4A, OGG, etc.) via PyAV
+    when soundfile/audioread can't open it. Returns float32 stereo array
+    of shape (channels, samples) at target_sr."""
+    import av
+    import numpy as _np
+    try:
+        from av.audio.resampler import AudioResampler
+    except ImportError:
+        AudioResampler = None
+
+    container = av.open(path)
+    try:
+        stream = next(s for s in container.streams if s.type == 'audio')
+    except StopIteration:
+        container.close()
+        raise RuntimeError(f"no audio stream in {path}")
+
+    resampler = None
+    if AudioResampler is not None:
+        resampler = AudioResampler(format='flt', layout='stereo', rate=target_sr)
+
+    chunks_l, chunks_r = [], []
+    try:
+        for frame in container.decode(stream):
+            if resampler is not None:
+                resampled = resampler.resample(frame)
+                # PyAV ≥10 returns a list, older returns a single frame
+                frames = resampled if isinstance(resampled, list) else [resampled]
+            else:
+                frames = [frame]
+            for fr in frames:
+                if fr is None:
+                    continue
+                arr = fr.to_ndarray()  # shape: (channels, samples) for non-planar fmt
+                if arr.ndim == 1:
+                    # interleaved single-block — split if stereo
+                    if fr.layout.name == 'stereo':
+                        arr = arr.reshape(-1, 2).T
+                    else:
+                        arr = _np.stack([arr, arr], axis=0)
+                if arr.shape[0] == 1:
+                    arr = _np.vstack([arr, arr])
+                chunks_l.append(arr[0].astype(_np.float32))
+                chunks_r.append(arr[1].astype(_np.float32))
+    finally:
+        container.close()
+
+    if not chunks_l:
+        raise RuntimeError(f"decoded zero audio frames from {path}")
+    L = _np.concatenate(chunks_l)
+    R = _np.concatenate(chunks_r)
+    # If we couldn't resample, leave at native rate
+    return _np.stack([L, R], axis=0), (target_sr if resampler is not None else stream.rate)
+
+
 def load_audio_stereo(path, sr=22050):
     """Load audio preserving stereo channels.
 
@@ -90,10 +170,18 @@ def load_audio_stereo(path, sr=22050):
     unchanged). L and R drive the stereo-specific extraction:
     width, correlation, pan position, frequency-dependent imaging.
 
+    Falls back to PyAV decode for formats librosa can't open natively
+    (WMA, some M4A/OGG variants, etc.).
+
     If the source is mono, L and R both equal M and the stereo block
     is skipped downstream."""
     print(f"  Loading: {path}")
-    y, sr = librosa.load(path, sr=sr, mono=False)
+    try:
+        y, sr = librosa.load(path, sr=sr, mono=False)
+    except Exception as exc:
+        print(f"  [audio] librosa failed ({type(exc).__name__}); falling back to PyAV...")
+        y, sr_native = _av_decode_stereo(path, target_sr=sr)
+        sr = sr_native
     if y.ndim == 1:
         print(f"  → {len(y)/sr:.1f}s @ {sr} Hz  (MONO source — "
               f"stereo features will be skipped)")
@@ -171,6 +259,23 @@ def extract_features(y, sr):
     # Structural segments
     segments = segment_song(rms, rms_times, chroma=chroma)
 
+    # ─── v2 MOTION LENSES (zero-dep extensions) ─────────────────────────
+    # tonnetz_trajectory + tempogram_stability run on the mono signal;
+    # vibrato_summary needs the harmonic-only signal (already computed
+    # above as y_harm). spectral_flux + attack_envelope run on mono.
+    # Sealed 2026-05-11 PT (ledger #1247-#1273 series, frontier #1168).
+    motion = {}
+    if _hm is not None:
+        try:
+            motion['harmonic'] = _hm.harmonic_motion_report(y, sr, y_harmonic=y_harm)
+        except Exception as e:
+            motion['harmonic'] = {'error': f'{type(e).__name__}: {e}'}
+    if _tm is not None:
+        try:
+            motion['timbral'] = _tm.timbral_motion_report(y, sr)
+        except Exception as e:
+            motion['timbral'] = {'error': f'{type(e).__name__}: {e}'}
+
     return {
         # raw arrays
         'S': S, 'S_db': S_db, 'freqs': freqs, 'times': times,
@@ -207,6 +312,7 @@ def extract_features(y, sr):
         'arousal': arousal,
         'quadrant': quadrant,
         'segments': segments,
+        'motion': motion,
     }
 
 
@@ -1039,6 +1145,84 @@ def generate_report(f, name, mood=None, note=None):
     else:
         stereo_section = "\n▌ STEREO FIELD\n  (mono source — no spatial dimension to report)\n"
 
+    # ─── LYRICS / VOCAL LAYER ──────────────────────────────────────────────
+    lyrics_section = ""
+    lyr = f.get('lyrics')
+    align = f.get('lyric_alignment') or []
+    if lyr and lyr.get('segments'):
+        hall = lyr.get('hallucination', {}) or {}
+        if hall.get('is_hallucination'):
+            # Honest report: ASR fired but on non-speech
+            lyrics_section = f"""
+▌ LYRICS / VOCAL LAYER
+  ASR fired but the transcript reads as a Whisper hallucination
+  (confidence {hall.get('confidence', 0):.2f}): {hall.get('reason', '')}.
+
+  This is a known failure mode when the audio is vocalise, instrumental,
+  or otherwise wordless — the model substitutes ghost-text from its
+  training data (subtitle credits, "Thank you for watching", etc.).
+
+  Treating this song as: NON-LYRICAL — the meaning lives in the
+  frequency-architecture layer, not the lyrical-message layer.
+"""
+        else:
+            segs_l = lyr['segments']
+            lang = lyr.get('language', '?')
+            lp = lyr.get('language_probability', 0.0)
+            dev = lyr.get('device', '?')
+            ct  = lyr.get('compute_type', '?')
+            model = lyr.get('model', '?')
+            n = len(segs_l)
+            head = segs_l[:16]
+            body_lines = '\n'.join(
+                (f"  [{int(s['start']//60):02d}:{s['start']%60:05.2f} → "
+                 f"{int(s['end']//60):02d}:{s['end']%60:05.2f}]  {s['text']}"
+                 + (f"\n      ↳ {s['delivery']['delivery_md']}" if s.get('delivery') else ''))
+                for s in head
+            )
+            tail_note = f"\n  … ({n - 16} more segments — see lyrics.md)" if n > 16 else ""
+            align_lines = ""
+            if align:
+                top_align = align[:5]
+                align_lines = "\n\n  Lyric–tension alignment (top 5 peaks):\n" + '\n'.join(
+                    f"    t={int(a['peak_time']//60):02d}:{a['peak_time']%60:05.2f}  "
+                    f"strength={a['peak_strength']:.2f}  {a['relation']:<7} → "
+                    f"\"{(a['lyric_text'] or '')[:60]}\""
+                    for a in top_align
+                )
+
+            ds = lyr.get('delivery_summary') or {}
+            delivery_block = ""
+            if ds:
+                delivery_block = (
+                    f"\n\n  Vocal performance (HOW the artist sings, not just WHAT):\n"
+                    f"    Force ........ dominant: {ds.get('dominant_force', '?'):<8s} "
+                    f"distribution: {ds.get('force_distribution', {})}\n"
+                    f"    Texture ...... dominant: {ds.get('dominant_texture', '?'):<8s} "
+                    f"distribution: {ds.get('texture_distribution', {})}\n"
+                    f"    Dynamics ..... dominant: {ds.get('dominant_dynamics', '?'):<8s} "
+                    f"distribution: {ds.get('dynamics_distribution', {})}\n"
+                    f"    Pitch motion . dominant: {ds.get('dominant_pitch_motion', '?'):<8s} "
+                    f"distribution: {ds.get('pitch_motion_distribution', {})}\n"
+                    f"    Mean pitch range per line: {ds.get('mean_pitch_range_semi', 0):.1f} semitones"
+                )
+
+            lyrics_section = f"""
+▌ LYRICS / VOCAL LAYER  (what the song says, alongside what it does)
+  Model: {model} on {dev} ({ct})  |  Language: {lang} (p={lp:.2f})  |  {n} segments
+
+{body_lines}{tail_note}{align_lines}{delivery_block}
+
+  Note: words and sound are two channels of the same signal. The
+  lyrical-message layer can confirm, complicate, or contradict the
+  sonic-affect layer. Read both before forming a take.
+"""
+    elif lyr is None:
+        # Whisper was disabled or skipped — say nothing
+        pass
+    else:
+        lyrics_section = "\n▌ LYRICS / VOCAL LAYER\n  (no transcribable vocals detected — likely instrumental, vocalise, or sub-threshold)\n"
+
     report = f"""
 ================================================================
   SENSORY REPORT  ::  "{name}"
@@ -1099,7 +1283,7 @@ def generate_report(f, name, mood=None, note=None):
 
 ▌ STRUCTURAL ARC
 {segs}
-{stereo_section}
+{stereo_section}{lyrics_section}
 ▌ SYNESTHETIC TRANSLATION
   Texture  →  {texture_metaphor(f)}
   Color    →  {color_word(f)}
@@ -1209,6 +1393,7 @@ def diff_reports(f_a, f_b, name_a, name_b):
 # ─── PIPELINE ENTRY ───────────────────────────────────────────────────────────
 def run_full_pipeline(audio_path, out_dir, label=None, mood=None, note=None):
     """Full analysis + all visualizations + report. Returns (features, report)."""
+    import threading, time as _time
     os.makedirs(out_dir, exist_ok=True)
     name = label or os.path.splitext(os.path.basename(audio_path))[0]
 
@@ -1218,16 +1403,39 @@ def run_full_pipeline(audio_path, out_dir, label=None, mood=None, note=None):
     print(f"  Output: {out_dir}")
     print(f"{'='*60}\n")
 
-    print("[1/15] Loading audio (stereo-aware)...")
+    # ─── PARALLEL: kick off Whisper transcription on a background thread
+    # so it runs concurrently with the librosa pipeline (CPU vs GPU split).
+    whisper_holder = {'result': None, 'alignment': None, 'error': None,
+                      'elapsed': 0.0}
+
+    def _whisper_worker():
+        if not _LYRICS_ENABLED:
+            return
+        t0 = _time.time()
+        try:
+            from lyric_transcribe import transcribe
+            whisper_holder['result'] = transcribe(audio_path, model_size=_LYRICS_MODEL)
+        except Exception as exc:
+            whisper_holder['error'] = repr(exc)
+        finally:
+            whisper_holder['elapsed'] = _time.time() - t0
+
+    whisper_thread = None
+    if _LYRICS_ENABLED:
+        print(f"[*] Whisper background thread starting ({_LYRICS_MODEL})...")
+        whisper_thread = threading.Thread(target=_whisper_worker, daemon=True)
+        whisper_thread.start()
+
+    print("[1/16] Loading audio (stereo-aware)...")
     M, L, R, sr = load_audio_stereo(audio_path)
     y = M
 
-    print("[2/15] Extracting features...")
+    print("[2/16] Extracting features...")
     f = extract_features(y, sr)
     print(f"  → Key: {f['key']} {f['mode']}  |  Tempo: {f['tempo']:.1f} BPM  "
           f"|  Duration: {f['duration']:.1f}s  |  Entropy: {f['mean_entropy']:.2f} bits")
 
-    print("[3/15] Extracting stereo field...")
+    print("[3/16] Extracting stereo field...")
     f['stereo'] = extract_stereo_features(L, R, sr)
     if f['stereo'].get('is_stereo'):
         print(f"  → STEREO  width={f['stereo']['mean_width']:.3f}  "
@@ -1236,44 +1444,44 @@ def run_full_pipeline(audio_path, out_dir, label=None, mood=None, note=None):
     else:
         print("  → mono source (stereo plots and report section will be skipped)")
 
-    print("[4/15]  Waveform...")
+    print("[4/16]  Waveform...")
     plot_waveform(y, sr, os.path.join(out_dir, 'waveform.png'))
 
-    print("[5/15]  Spectrogram...")
+    print("[5/16]  Spectrogram...")
     plot_spectrogram(f['S_db'], sr, f['times'], f['freqs'],
                      os.path.join(out_dir, 'spectrogram.png'))
 
-    print("[6/15]  Chroma...")
+    print("[6/16]  Chroma...")
     plot_chroma(f['chroma'], f['times'], os.path.join(out_dir, 'chroma.png'))
 
-    print("[7/15]  Energy arc...")
+    print("[7/16]  Energy arc...")
     plot_energy_arc(f['rms'], f['centroid'], f['rms_times'],
                     os.path.join(out_dir, 'energy_arc.png'))
 
-    print("[8/15]  MFCCs...")
+    print("[8/16]  MFCCs...")
     plot_mfcc(f['mfcc'], f['times'], os.path.join(out_dir, 'mfcc.png'))
 
-    print("[9/15]  HPSS...")
+    print("[9/16]  HPSS...")
     plot_hpss(f['y_harm'], f['y_perc'], sr,
               os.path.join(out_dir, 'hpss.png'))
 
-    print("[10/15] Beat grid...")
+    print("[10/16] Beat grid...")
     plot_beats(y, sr, f['beat_times'], f['onset_times'], f['tempo'],
                os.path.join(out_dir, 'beats.png'))
 
-    print("[11/15] Cymatic field...")
+    print("[11/16] Cymatic field...")
     plot_cymatic(f['chroma_avg'], f['key'], f['mode'],
                  os.path.join(out_dir, 'cymatic.png'))
 
-    print("[12/15] Color timeline...")
+    print("[12/16] Color timeline...")
     plot_color_timeline(f['chroma'], f['rms'], f['zcr'], f['rms_times'],
                         os.path.join(out_dir, 'color_timeline.png'))
 
-    print("[13/15] Tension arc...")
+    print("[13/16] Tension arc...")
     plot_tension(f['onset_env'], f['onset_env_times'], f['tension_peaks'],
                  os.path.join(out_dir, 'tension.png'))
 
-    print("[14/15] Stereo field plots...")
+    print("[14/16] Stereo field plots...")
     if f['stereo'].get('is_stereo'):
         plot_stereo_field(f['stereo']['SL'], f['stereo']['SR'],
                           f['stereo']['stereo_times'], sr,
@@ -1285,7 +1493,54 @@ def run_full_pipeline(audio_path, out_dir, label=None, mood=None, note=None):
     else:
         print("  → skipped (mono source)")
 
-    print("[15/15] Generating report...")
+    f['lyrics'] = None
+    f['lyric_alignment'] = None
+    if _LYRICS_ENABLED and whisper_thread is not None:
+        print("[15/16] Awaiting Whisper background thread...")
+        whisper_thread.join()
+        if whisper_holder['error']:
+            print(f"  [whisper] FAILED: {whisper_holder['error']} — continuing without lyrics")
+        elif whisper_holder['result']:
+            from lyric_transcribe import align_lyrics_to_peaks, render_lyrics_md
+            lyric_result = whisper_holder['result']
+
+            # Extract HOW the artist sings each line (force / texture / dynamics / pitch)
+            # — only if the transcript is real (not a hallucination).
+            hall = lyric_result.get('hallucination', {}) or {}
+            if lyric_result['segments'] and not hall.get('is_hallucination'):
+                try:
+                    from vocal_delivery import extract_vocal_delivery, delivery_summary
+                    print(f"  [delivery] reading vocal performance per segment...")
+                    enriched = extract_vocal_delivery(lyric_result['segments'], y, sr)
+                    lyric_result['segments'] = enriched
+                    lyric_result['delivery_summary'] = delivery_summary(enriched)
+                    ds = lyric_result['delivery_summary']
+                    if ds:
+                        print(f"  [delivery] dominant: {ds.get('dominant_force')} · "
+                              f"{ds.get('dominant_texture')} · {ds.get('dominant_dynamics')} · "
+                              f"{ds.get('dominant_pitch_motion')}  "
+                              f"(mean pitch range: {ds.get('mean_pitch_range_semi', 0):.1f} semitones)")
+                except Exception as exc:
+                    print(f"  [delivery] FAILED (non-fatal): {exc!r}")
+
+            lyric_alignment = align_lyrics_to_peaks(
+                lyric_result['segments'], f.get('tension_peaks', []),
+            )
+            f['lyrics'] = lyric_result
+            f['lyric_alignment'] = lyric_alignment
+            with open(os.path.join(out_dir, 'lyrics.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'transcription': lyric_result, 'alignment': lyric_alignment},
+                          fh, indent=2, ensure_ascii=False)
+            with open(os.path.join(out_dir, 'lyrics.md'), 'w', encoding='utf-8') as fh:
+                fh.write(render_lyrics_md(lyric_result, lyric_alignment, song_label=name))
+            n_seg = len(lyric_result['segments'])
+            print(f"  → {n_seg} segments, language={lyric_result['language']} "
+                  f"({lyric_result['device']}/{lyric_result['compute_type']}) "
+                  f"in {whisper_holder['elapsed']:.1f}s (parallel)")
+    else:
+        print("[15/16] Lyrics skipped.")
+
+    print("[16/16] Generating report...")
     report = generate_report(f, name, mood=mood, note=note)
 
     with open(os.path.join(out_dir, 'report.md'), 'w', encoding='utf-8') as fh:
@@ -1312,6 +1567,36 @@ def run_full_pipeline(audio_path, out_dir, label=None, mood=None, note=None):
             hb['operator_note'] = note
         json.dump(hb, fh, indent=2)
 
+    # ─── DB CAPTURE — substrate for backward-recall
+    try:
+        from listen_db import record_listen, maybe_draft_entity_take
+        lyrics_md_text = None
+        try:
+            with open(os.path.join(out_dir, 'lyrics.md'), 'r', encoding='utf-8') as fh:
+                lyrics_md_text = fh.read()
+        except FileNotFoundError:
+            pass
+        listen_id = record_listen(
+            f, audio_path,
+            source=_LISTEN_SOURCE,
+            why_brought_md=_LISTEN_WHY,
+            vocal_mode=_LISTEN_VOCAL_MODE,
+            primary_layer=_LISTEN_PRIMARY_LAYER,
+            felt_response_md=note,
+            report_md=report,
+            lyrics_md=lyrics_md_text,
+            report_dir=os.path.abspath(out_dir),
+            tags=_LISTEN_TAGS,
+            lyric_segments=(f.get('lyrics') or {}).get('segments') if f.get('lyrics') else None,
+            lyric_alignment=f.get('lyric_alignment'),
+        )
+        print(f"  [db] listen #{listen_id} captured to listening.db")
+        drafted = maybe_draft_entity_take(listen_id, audio_path)
+        for d in drafted:
+            print(f"  [db] pending entity-take draft: {d['kind']}={d['display']} (n={d['n']})")
+    except Exception as exc:
+        print(f"  [db] capture FAILED (non-fatal): {exc!r}")
+
     print(f"\n{'='*60}")
     print("  DONE")
     print(f"  → {os.path.abspath(out_dir)}")
@@ -1337,8 +1622,34 @@ def main():
         help='Compare two audio files; produces a diff report.')
     parser.add_argument('--label', default=None,
         help='Override the song label used in the report.')
+    parser.add_argument('--no-lyrics', action='store_true',
+        help='Skip Whisper lyric transcription (faster).')
+    parser.add_argument('--whisper-model', default='large-v3',
+        help='faster-whisper model size: tiny|base|small|medium|large-v3 (default: large-v3)')
+    parser.add_argument('--source', default=None,
+        help='Listen source: walt-shared / self-pick / heartbeat / requested')
+    parser.add_argument('--why', default=None,
+        help='Why this listen — context that gates depth of attention')
+    parser.add_argument('--vocal-mode', default=None,
+        choices=['lyrical','foreign-lyrical','vocalise','spoken','instrumental','hybrid'],
+        help='Vocal layer kind')
+    parser.add_argument('--primary-layer', default=None,
+        choices=['frequency-architecture','lyrical-message','rhythmic-drive','texture','melody','narrative-arc'],
+        help='Which layer the song does its work on')
+    parser.add_argument('--tag', action='append', default=None, dest='tags',
+        help='Tag (repeatable): sigil-listen, walt-shared, post-§16, etc.')
 
     args = parser.parse_args()
+
+    global _LYRICS_ENABLED, _LYRICS_MODEL
+    global _LISTEN_SOURCE, _LISTEN_WHY, _LISTEN_VOCAL_MODE, _LISTEN_PRIMARY_LAYER, _LISTEN_TAGS
+    _LYRICS_ENABLED = not args.no_lyrics
+    _LYRICS_MODEL   = args.whisper_model
+    _LISTEN_SOURCE        = args.source
+    _LISTEN_WHY           = args.why
+    _LISTEN_VOCAL_MODE    = args.vocal_mode
+    _LISTEN_PRIMARY_LAYER = args.primary_layer
+    _LISTEN_TAGS          = args.tags
 
     if args.compare:
         path_a, path_b = args.compare
